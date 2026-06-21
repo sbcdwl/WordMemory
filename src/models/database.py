@@ -5,69 +5,92 @@
 
 import sqlite3
 import os
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 
 class Database:
-    """数据库管理类（单例模式）"""
+    """数据库管理类（单例模式 + 线程安全）"""
     
     _instance = None
-    _connection = None
+    _lock = threading.Lock()
     
     def __new__(cls):
-        """单例模式：确保全局只有一个数据库连接"""
+        """单例模式：确保全局只有一个实例"""
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
         return cls._instance
     
     def __init__(self):
-        """初始化数据库连接"""
-        if self._connection is None:
-            # 数据库文件路径（相对于项目根目录）
-            self.db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                                        'data', 'word_memory.db')
-            
+        """初始化数据库配置"""
+        if not hasattr(self, '_initialized'):
+            self.db_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                'data', 'word_memory.db'
+            )
             # 确保 data 目录存在
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             
-            # 建立连接
-            self._connection = sqlite3.connect(self.db_path)
-            self._connection.row_factory = sqlite3.Row  # 支持按列名访问
+            # 线程本地存储：每个线程有自己的连接
+            self._local = threading.local()
             
-            # 启用 WAL 模式（提高并发和安全）
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            
-            # 启用外键约束
-            self._connection.execute("PRAGMA foreign_keys=ON")
+            # 主线程初始化连接
+            self._get_connection()
             
             # 创建所有表
             self._create_tables()
             
             # 初始化默认设置
             self._init_default_settings()
+            
+            self._initialized = True
+    
+    def _get_connection(self):
+        """
+        获取当前线程的数据库连接
+        如果当前线程没有连接，创建一个新的
+        """
+        if not hasattr(self._local, 'connection') or self._local.connection is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            # 启用 WAL 模式
+            conn.execute("PRAGMA journal_mode=WAL")
+            # 启用外键约束
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._local.connection = conn
+        return self._local.connection
     
     def get_connection(self):
-        """获取数据库连接"""
-        return self._connection
+        """获取当前线程的数据库连接"""
+        return self._get_connection()
     
     def get_cursor(self):
-        """获取游标"""
-        return self._connection.cursor()
+        """获取当前线程的游标"""
+        return self._get_connection().cursor()
     
     def commit(self):
-        """提交事务"""
-        self._connection.commit()
+        """提交当前线程的事务"""
+        conn = self._get_connection()
+        conn.commit()
     
     def close(self):
-        """关闭数据库连接"""
-        if self._connection:
-            self._connection.close()
-            self._connection = None
+        """关闭当前线程的数据库连接"""
+        if hasattr(self._local, 'connection') and self._local.connection:
+            self._local.connection.close()
+            self._local.connection = None
+    
+    def close_all(self):
+        """关闭所有线程的连接（程序退出时调用）"""
+        # 只关闭当前线程的连接
+        self.close()
     
     def _create_tables(self):
         """创建所有表（如果不存在）"""
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         
         # 1. 词书表
         cursor.execute('''
@@ -136,21 +159,22 @@ class Database:
             )
         ''')
         
-        self._connection.commit()
+        conn.commit()
     
     def _init_default_settings(self):
         """初始化默认设置（如果不存在）"""
         default_settings = {
             'daily_new_words': '20',
-            'review_mode': 'show_then_check',  # 'show_then_check' 或 'type_answer'
+            'review_mode': 'show_then_check',
             'max_examples_display': '2',
             'show_phonetic': 'true',
-            'ease_factor_min': '1.3',      # 算法参数：最小难度因子
-            'ease_factor_max': '2.5',      # 算法参数：最大难度因子
-            'wrong_penalty_factor': '0.15' # 算法参数：错误惩罚系数
+            'ease_factor_min': '1.3',
+            'ease_factor_max': '2.5',
+            'wrong_penalty_factor': '0.15'
         }
         
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         now = datetime.now().isoformat()
         
         for key, value in default_settings.items():
@@ -159,13 +183,14 @@ class Database:
                 VALUES (?, ?, ?)
             ''', (key, value, now))
         
-        self._connection.commit()
+        conn.commit()
     
     def execute_query(self, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
         """
         执行查询并返回字典列表
         """
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.execute(sql, params)
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
@@ -174,38 +199,42 @@ class Database:
         """
         执行更新操作，返回受影响的行数
         """
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.execute(sql, params)
-        self._connection.commit()
+        conn.commit()
         return cursor.rowcount
     
     def execute_insert(self, sql: str, params: tuple = ()) -> int:
         """
         执行插入操作，返回最后插入的ID
         """
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.execute(sql, params)
-        self._connection.commit()
+        conn.commit()
         return cursor.lastrowid
     
     def execute_many(self, sql: str, params_list: List[tuple]) -> int:
         """
         批量执行操作
         """
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.executemany(sql, params_list)
-        self._connection.commit()
+        conn.commit()
         return cursor.rowcount
     
     def get_setting(self, key: str, default: Any = None) -> Any:
         """
-        获取设置值（自动解析JSON）
+        获取设置值
         """
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
         row = cursor.fetchone()
         if row:
-            return row[0]  # 简单值，暂不解析JSON
+            return row[0]
         return default
     
     def update_setting(self, key: str, value: Any):
@@ -213,13 +242,14 @@ class Database:
         更新设置值
         """
         now = datetime.now().isoformat()
-        cursor = self._connection.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO settings (key, value, updated_date)
             VALUES (?, ?, ?)
         ''', (key, str(value), now))
-        self._connection.commit()
+        conn.commit()
 
 
-# 全局数据库实例（方便导入使用）
+# 全局数据库实例
 db = Database()
