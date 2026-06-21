@@ -724,7 +724,16 @@ class MainWindow(QMainWindow):
     
     def _on_import(self):
         """导入词书"""
-        QMessageBox.information(self, "提示", "导入功能开发中...")
+        from .import_dialog import ImportDialog
+        dialog = ImportDialog(self)
+        if dialog.exec_():
+            # 导入成功，刷新
+            imported_book_id = dialog.get_imported_book_id()
+            if imported_book_id:
+                self.scheduler = Scheduler(imported_book_id)
+                self._update_info()
+                self._load_today_queue()
+                QMessageBox.information(self, "成功", "词书导入成功！")
     
     def _on_settings(self):
         """打开设置"""
